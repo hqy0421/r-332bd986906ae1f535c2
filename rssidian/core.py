@@ -15,6 +15,7 @@ from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeEl
 
 from .config import Config
 from .models import Article, Feed
+from .provenance import compute_content_hash, select_processing_text
 from .rss import process_all_feeds
 
 # Configure logging
@@ -85,7 +86,8 @@ class RSSProcessor:
                 "auto_muted": 0,
                 "jina_enhanced": 0,
                 "with_summary": 0,
-                "with_value_analysis": 0
+                "with_value_analysis": 0,
+                "upgraded_articles": 0
             }
 
     def _call_openrouter_api(self, prompt: str, model: Optional[str] = None) -> Optional[str]:
@@ -154,11 +156,12 @@ class RSSProcessor:
         Returns:
             Summary text or None if summarization failed
         """
-        if not article.content:
+        text = select_processing_text(article)
+        if not text:
             logger.warning(f"Article {article.id} has no content to summarize")
             return None
 
-        prompt = self.config.openrouter_prompt.format(content=article.content)
+        prompt = self.config.openrouter_prompt.format(content=text)
         return self._call_openrouter_api(prompt)
 
     def _analyze_value(self, article: Article) -> Tuple[Optional[str], Optional[int], Optional[str]]:
@@ -171,10 +174,11 @@ class RSSProcessor:
         Returns:
             Tuple of (quality_tier, quality_score, labels)
         """
-        if not self.config.value_prompt_enabled or not article.content:
+        text = select_processing_text(article)
+        if not self.config.value_prompt_enabled or not text:
             return None, None, None
 
-        prompt = self.config.value_prompt.format(content=article.content)
+        prompt = self.config.value_prompt.format(content=text)
         response = self._call_openrouter_api(prompt, self.config.openrouter_processing_model)
 
         if not response:
@@ -469,7 +473,7 @@ class RSSProcessor:
         Returns:
             List of similar articles
         """
-        if not article.content:
+        if not select_processing_text(article):
             return []
 
         threshold = similarity_threshold or self.config.similarity_threshold
@@ -491,13 +495,28 @@ class RSSProcessor:
         return list(all_similar.values())
 
     def _find_content_similar_articles(self, article: Article, threshold: float) -> List[Article]:
-        """Find articles similar by content using embeddings."""
-        # Generate embedding for the article
-        text_to_embed = article.content
-        if article.summary:
-            text_to_embed = article.summary + "\n\n" + text_to_embed
+        """Find articles similar by content using embeddings.
 
-        query_embedding = self._generate_embedding(text_to_embed)
+        Uses the article's stored embedding when it was generated from the
+        current content version, so the query vector matches the vectors in
+        the index. Otherwise it re-embeds the same text used for indexing.
+        """
+        # Prefer the stored vector when it matches the current content version
+        query_embedding = None
+        if (
+            article.embedding_vector
+            and article.embedding_content_hash
+            and article.embedding_content_hash == compute_content_hash(
+                select_processing_text(article)
+            )
+        ):
+            try:
+                query_embedding = json.loads(article.embedding_vector)
+            except (json.JSONDecodeError, TypeError):
+                query_embedding = None
+
+        if query_embedding is None:
+            query_embedding = self._generate_embedding(select_processing_text(article))
 
         # Load index if needed
         if self._vector_index is None:
@@ -640,13 +659,14 @@ class RSSProcessor:
         for i, article in enumerate(articles, 1):
             feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
             feed_name = feed.title if feed else "Unknown Feed"
-            
+
             # Add source information
             sources.append(f"Source {i}: {article.title} ({feed_name}) - {article.url}")
-            
+
             # Add content with source label
-            if article.content:
-                combined_content.append(f"--- Source {i} Content ---\n{article.content}")
+            text = select_processing_text(article)
+            if text:
+                combined_content.append(f"--- Source {i} Content ---\n{text}")
 
         if not combined_content:
             logger.warning("No content found in article group")
@@ -690,6 +710,9 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
         if not unprocessed:
             logger.info("No unprocessed articles found")
+            # An upgraded article may have already been re-analyzed inline;
+            # still repair any summary left over from an older content version.
+            self._refresh_stale_summaries()
             return {"articles_processed": 0, "with_summary": 0, "with_value": 0, "with_embedding": 0, "groups_processed": 0}
 
         # Initialize counters
@@ -724,10 +747,12 @@ Provide a comprehensive summary that synthesizes information from all sources.""
             
             for article in unprocessed:
                 try:
-                    if article.content:
-                        embedding = self._generate_embedding(article.content)
+                    text = select_processing_text(article)
+                    if text:
+                        embedding = self._generate_embedding(text)
                         self._store_embedding(article.id, embedding)
                         article.embedding_generated = True
+                        article.embedding_content_hash = compute_content_hash(text)
                         stats["with_embedding"] += 1
                 except Exception as e:
                     logger.error(f"Error generating embedding for article {article.id}: {str(e)}")
@@ -763,6 +788,11 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                             # Set the grouped summary for all articles in the group
                             if grouped_summary:
                                 article.summary = grouped_summary
+                                # Record the content version this summary is based
+                                # on so summary and embedding share one version.
+                                article.summary_content_hash = compute_content_hash(
+                                    select_processing_text(article)
+                                )
                                 stats["with_summary"] += 1
 
                             # Analyze value (done individually for each article)
@@ -779,9 +809,13 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                             article.processed_at = datetime.utcnow()
                             stats["articles_processed"] += 1
 
-                            # Track statistics for this feed
+                            # Track statistics for this feed.
+                            # Upgraded articles (content_version > 1) already
+                            # contributed to these counters; only re-tally their
+                            # quality, not their existence.
                             feed_id = article.feed_id
-                            feed_stats[feed_id]["new_articles"] += 1
+                            if (getattr(article, "content_version", 1) or 1) <= 1:
+                                feed_stats[feed_id]["new_articles"] += 1
                             if article.quality_tier:
                                 feed_stats[feed_id]["quality_tiers"][article.quality_tier] += 1
                             if article.quality_score:
@@ -813,7 +847,52 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         # Update feed statistics
         self._update_feed_statistics(feed_stats)
 
+        # Refresh summaries that were derived from an older content version.
+        # This catches upgraded (summary-only -> full text) articles whose
+        # summary was invalidated without being regenerated inline, without
+        # counting them as new articles again.
+        self._refresh_stale_summaries()
+
         return stats
+
+    def _refresh_stale_summaries(self, limit: int = 200) -> int:
+        """Regenerate summaries whose recorded content version is stale.
+
+        Only rows that *had* a summary derived from a different content version
+        are refreshed; articles that never got a summary (``summary_content_hash``
+        is NULL) are left to normal processing so this does not turn every
+        failed summary attempt into a second API call.
+        """
+        if not self.config.openrouter_api_key or not self.config.openrouter_prompt:
+            return 0
+
+        stale = self.db_session.query(Article).filter(
+            Article.processed.is_(True),
+            Article.content_hash.isnot(None),
+            Article.summary_content_hash.isnot(None),
+            Article.summary_content_hash != Article.content_hash,
+        ).limit(limit).all()
+
+        if not stale:
+            return 0
+
+        refreshed = 0
+        for article in stale:
+            text = select_processing_text(article)
+            if not text:
+                continue
+            try:
+                summary = self._generate_summary(article)
+                if summary:
+                    article.summary = summary
+                    article.summary_content_hash = compute_content_hash(text)
+                    refreshed += 1
+            except Exception as e:
+                logger.error(f"Error refreshing summary for article {article.id}: {e}")
+        self.db_session.commit()
+        if refreshed:
+            logger.info(f"Refreshed {refreshed} summaries from updated content versions")
+        return refreshed
 
     def backfill_embeddings(self, batch_size: int = 100) -> Dict[str, int]:
         """
@@ -830,13 +909,19 @@ Provide a comprehensive summary that synthesizes information from all sources.""
         """
         # Find articles that are processed but missing embeddings
         # Check both embedding_vector IS NULL and embedding_generated=False
-        # to catch all cases (e.g., articles processed during ingestion skip embeddings)
-        from sqlalchemy import or_
+        # to catch all cases (e.g., articles processed during ingestion skip embeddings).
+        # Also repair processed articles whose embedding was generated from an
+        # older content version (e.g. a summary-only row later upgraded to full text).
+        from sqlalchemy import and_, or_
         missing = self.db_session.query(Article).filter(
             Article.processed == True,
             or_(
                 Article.embedding_vector.is_(None),
-                Article.embedding_generated == False
+                Article.embedding_generated == False,
+                and_(
+                    Article.content_hash.isnot(None),
+                    Article.embedding_content_hash != Article.content_hash,
+                ),
             )
         ).all()
 
@@ -862,11 +947,12 @@ Provide a comprehensive summary that synthesizes information from all sources.""
 
             for i, article in enumerate(missing):
                 try:
-                    text = article.content or article.summary or article.description
+                    text = select_processing_text(article)
                     if text:
                         embedding = self._generate_embedding(text)
                         self._store_embedding(article.id, embedding)
                         article.embedding_generated = True
+                        article.embedding_content_hash = compute_content_hash(text)
                         stats["succeeded"] += 1
                     else:
                         stats["failed"] += 1
@@ -970,7 +1056,9 @@ Provide a comprehensive summary that synthesizes information from all sources.""
                     feed = self.db_session.query(Feed).filter_by(id=article.feed_id).first()
 
                     # Generate excerpt around the most relevant part
-                    excerpt = self._generate_excerpt(article.content, query, self.config.excerpt_length)
+                    excerpt = self._generate_excerpt(
+                        select_processing_text(article), query, self.config.excerpt_length
+                    )
 
                     results.append({
                         "id": article.id,

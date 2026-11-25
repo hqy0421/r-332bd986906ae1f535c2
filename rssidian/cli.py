@@ -602,8 +602,11 @@ def ingest(ctx, lookback, debug):
         if 'auto_muted' in result and result['auto_muted'] > 0:
             click.echo(f"Auto-muted {result['auto_muted']} feeds due to persistent errors. Use 'subscriptions list' to see details.")
         
-        # Step 2: Process fetched articles (summary, value analysis, embeddings)
-        if result['new_articles'] > 0:
+        # Step 2: Process fetched articles (summary, value analysis, embeddings).
+        # Also run when articles were upgraded from summary-only to full text, so
+        # their invalidated summaries/embeddings are regenerated from the new copy.
+        upgraded_articles = result.get('upgraded_articles', 0)
+        if result['new_articles'] > 0 or upgraded_articles > 0:
             click.echo("Processing new articles...")
             process_result = processor.process_articles()
             click.echo(f"Processed {process_result['articles_processed']} articles:")

@@ -6,6 +6,7 @@ This script rebuilds the vector index from scratch for all articles.
 
 import os
 import sys
+import json
 import logging
 from typing import List, Dict, Any
 from tqdm import tqdm
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from rssidian.config import Config
 from rssidian.models import get_db_session, Article
+from rssidian.provenance import compute_content_hash, select_processing_text
 from sentence_transformers import SentenceTransformer
 from annoy import AnnoyIndex
 
@@ -67,22 +69,21 @@ def main():
         # Process articles with progress bar
         logger.info(f"Processing {len(articles)} articles...")
         for article in tqdm(articles, desc="Generating embeddings"):
-            if article.content:
-                # Generate text to embed
-                text_to_embed = article.content
-                if article.summary:
-                    text_to_embed = article.summary + "\n\n" + text_to_embed
-                
+            # Use the same content version the summary was generated from
+            text_to_embed = select_processing_text(article)
+            if text_to_embed:
                 # Generate embedding
                 embedding = generate_embedding(embedding_model, text_to_embed)
-                
+
                 # Add to index
                 vector_index.add_item(article.id, embedding)
-                
-                # Update article
+
+                # Update article, keeping the vector in sync with the index
+                article.embedding_vector = json.dumps(embedding)
                 article.embedding_generated = True
+                article.embedding_content_hash = compute_content_hash(text_to_embed)
                 stats["with_embedding"] += 1
-            
+
             stats["articles_processed"] += 1
         
         # Build and save the index

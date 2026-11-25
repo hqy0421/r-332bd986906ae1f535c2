@@ -14,6 +14,16 @@ from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn, TimeEl
 
 from .models import Feed, Article
 from .config import Config
+from .provenance import (
+    ACCEPT_UPGRADED,
+    CONTENT_SOURCE_SUPPLEMENTAL,
+    STATUS_FULL_TEXT,
+    adopt_entry_content,
+    apply_content_adoption,
+    compute_content_hash,
+    extract_entry_text,
+    should_upgrade,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -318,43 +328,19 @@ def extract_origin_url(description: str) -> Optional[str]:
 
 
 def extract_content(entry: Dict[str, Any]) -> str:
-    """Extract the main content from a feed entry."""
-    content = ""
-    
-    # Try different content fields in order of preference
-    # Some feeds put the full content in the 'content' field
-    if 'content' in entry and entry['content']:
-        for content_item in entry['content']:
-            if 'value' in content_item:
-                content = content_item['value']
-                # If content is substantial, return it
-                if len(content) > 500:  # Arbitrary threshold for "substantial" content
-                    return content
-    
-    # Try other common fields
-    if not content and 'summary_detail' in entry and 'value' in entry['summary_detail']:
-        content = entry['summary_detail']['value']
-    
-    if not content and 'summary' in entry:
-        content = entry['summary']
-    
-    if not content and 'description' in entry:
-        content = entry['description']
-    
-    # Some feeds include content in non-standard fields
-    if not content and 'content_encoded' in entry:
-        content = entry['content_encoded']
-    
-    # Some feeds include content in the 'value' field directly
-    if not content and 'value' in entry:
-        content = entry['value']
-        
+    """Extract the main content from a feed entry.
+
+    Retained for backwards compatibility; the field-preference logic lives in
+    :func:`rssidian.provenance.extract_entry_text`.
+    """
+    content = extract_entry_text(entry)
+
     # Log if we couldn't find any content
     if not content:
         logger.warning(f"No content found in feed entry: {entry.get('title', 'Unknown title')}")
         # Print available fields for debugging
         logger.debug(f"Available fields: {list(entry.keys())}")
-    
+
     return content
 
 
@@ -493,9 +479,147 @@ def get_feed_entries(feed_url: str, lookback_days: int = 7, max_retries: int = 3
                 return []
 
 
+def _analyze_article(
+    article: Article,
+    content: str,
+    config: Config,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, bool]:
+    """Generate summary and value analysis for an article from ``content``.
+
+    Returns ``(summary_generated, value_analyzed)``.
+    """
+    if progress_callback:
+        progress_callback(f"Analyzing article: {article.title[:30]}")
+
+    analysis_start_time = time.time()
+    summary_generated = False
+    value_analyzed = False
+
+    # Generate summary
+    if config.openrouter_api_key and config.openrouter_prompt:
+        logger.info(f"Generating summary for article: {article.title[:50]}")
+        summary_start_time = time.time()
+        summary = generate_summary(
+            content,
+            config.openrouter_api_key,
+            config.openrouter_prompt,
+            config.openrouter_model
+        )
+        summary_duration = time.time() - summary_start_time
+        if summary:
+            article.summary = summary
+            # Record the content version this summary was derived from so the
+            # summary and the vector index consume the same copy.
+            article.summary_content_hash = compute_content_hash(content)
+            summary_generated = True
+            logger.info(f"Summary generated successfully in {summary_duration:.2f}s ({len(summary)} chars)")
+        else:
+            logger.warning(f"Failed to generate summary after {summary_duration:.2f}s")
+
+    # Analyze value
+    if config.openrouter_api_key and config.value_prompt_enabled and config.value_prompt:
+        logger.info(f"Analyzing value for article: {article.title[:50]}")
+        value_start_time = time.time()
+        quality_tier, quality_score, labels = analyze_value(
+            content,
+            config.openrouter_api_key,
+            config.value_prompt,
+            config.openrouter_processing_model or config.openrouter_model
+        )
+        value_duration = time.time() - value_start_time
+
+        article.quality_tier = quality_tier
+        article.quality_score = quality_score
+        article.labels = labels
+
+        if quality_tier:
+            value_analyzed = True
+            logger.info(f"Value analysis completed in {value_duration:.2f}s: Tier {quality_tier}, Score {quality_score}, Labels: {labels}")
+        else:
+            logger.warning(f"Value analysis failed after {value_duration:.2f}s")
+
+    # Mark as processed
+    article.processed = True
+    article.processed_at = datetime.utcnow()
+
+    total_analysis_duration = time.time() - analysis_start_time
+    logger.info(f"Total analysis time for article '{article.title[:50]}': {total_analysis_duration:.2f}s")
+    return summary_generated, value_analyzed
+
+
+def _maybe_upgrade_article(
+    existing_article: Article,
+    entry: Dict[str, Any],
+    source_url: Optional[str],
+    feed: Feed,
+    config: Optional[Config],
+    analyze_content: bool,
+    min_full_chars: int,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Upgrade a summary-only row in place when a duplicate is a full body.
+
+    Returns 1 if the article was upgraded (and re-analyzed), 0 otherwise.
+    The row is kept and its derived summary/embedding are invalidated so they
+    are regenerated from the new content version.
+    """
+    if existing_article.content_status == STATUS_FULL_TEXT:
+        # Already have the full body; only fill in missing provenance.
+        if not existing_article.source_public_url and source_url:
+            existing_article.source_public_url = source_url
+        return 0
+
+    # Classify the incoming copy. Only attempt a supplemental fetch when the
+    # duplicate comes from a different subscription; the same feed would just
+    # re-fetch identical summary text on every ingest.
+    from_same_feed = existing_article.content_source_feed_id == feed.id
+    assessment = adopt_entry_content(
+        entry,
+        source_url=source_url,
+        fetch_supplemental=fetch_jina_content,
+        clean_fn=clean_html,
+        threshold=min_full_chars,
+        fetch_if_not_full=not from_same_feed,
+    )
+
+    if not should_upgrade(existing_article, assessment):
+        # A legacy row has no provenance at all. If the incoming copy is
+        # identical, record where it came from (and reclassify its status) so it
+        # is not re-fetched on every ingest. Identical text means no version
+        # bump and no invalidation happens.
+        if (
+            existing_article.content_source is None
+            and (existing_article.content or "") == (assessment.text or "")
+        ):
+            apply_content_adoption(
+                existing_article, assessment, source_feed_id=feed.id
+            )
+        return 0
+
+    logger.info(
+        f"Upgrading summary-only article {existing_article.id} ('{existing_article.title[:50]}') "
+        f"to full text from feed {feed.title}"
+    )
+    changed = apply_content_adoption(
+        existing_article,
+        assessment,
+        source_feed_id=feed.id,
+        acceptance=ACCEPT_UPGRADED,
+    )
+    if not changed:
+        # Same text as before (e.g. a legacy row being reclassified); only the
+        # provenance fields were normalized, so nothing needs re-analysis.
+        return 0
+    # apply_content_adoption reset processed=False, so re-analyze now when possible.
+    if analyze_content and config and existing_article.content:
+        _analyze_article(existing_article, existing_article.content, config, progress_callback)
+    return 1
+
+
 def process_feed(
-    feed: Feed, 
-    db_session: Session, 
+    feed: Feed,
+    db_session: Session,
     lookback_days: int = 7,
     max_articles: int = 25,
     progress_callback: Optional[Callable[[str], None]] = None,
@@ -504,9 +628,44 @@ def process_feed(
     config: Optional[Config] = None,  # Configuration for article analysis
     analyze_content: bool = True  # Whether to analyze content during ingestion
 ) -> Tuple[int, int, int, int]:
+    """Process a feed, fetch new articles and store them in the database.
+
+    Returns:
+        Tuple of (new_articles, jina_enhanced, with_summary, with_value_analysis)
+    """
+    result = process_feed_result(
+        feed,
+        db_session,
+        lookback_days=lookback_days,
+        max_articles=max_articles,
+        progress_callback=progress_callback,
+        max_errors=max_errors,
+        retry_attempts=retry_attempts,
+        config=config,
+        analyze_content=analyze_content,
+    )
+    return (
+        result["new_articles"],
+        result["jina_enhanced"],
+        result["with_summary"],
+        result["with_value_analysis"],
+    )
+
+
+def process_feed_result(
+    feed: Feed,
+    db_session: Session,
+    lookback_days: int = 7,
+    max_articles: int = 25,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    max_errors: int = 5,  # Maximum number of consecutive errors before marking feed as inactive
+    retry_attempts: int = 3,  # Number of retry attempts for transient errors
+    config: Optional[Config] = None,  # Configuration for article analysis
+    analyze_content: bool = True  # Whether to analyze content during ingestion
+) -> Dict[str, int]:
     """
     Process a feed, fetch new articles and store them in the database.
-    
+
     Args:
         feed: Feed object
         db_session: SQLAlchemy database session
@@ -517,14 +676,23 @@ def process_feed(
         retry_attempts: Number of retry attempts for transient errors
         config: Configuration for article analysis
         analyze_content: Whether to analyze content during ingestion
-        
+
     Returns:
-        Tuple of (new_articles, jina_enhanced, with_summary, with_value_analysis)
+        Dictionary with new_articles, jina_enhanced, with_summary,
+        with_value_analysis and upgraded_articles counts
     """
+    empty_result = {
+        "new_articles": 0,
+        "jina_enhanced": 0,
+        "with_summary": 0,
+        "with_value_analysis": 0,
+        "upgraded_articles": 0,
+    }
+
     if feed.muted:
         if progress_callback:
             progress_callback(f"Skipping muted feed: {feed.title}")
-        return 0, 0, 0, 0
+        return empty_result
     
     if progress_callback:
         progress_callback(f"Processing feed: {feed.title}")
@@ -547,7 +715,7 @@ def process_feed(
                 logger.warning(f"Feed {feed.title} has had no entries for {feed.no_entries_count} consecutive checks")
             
             db_session.commit()
-            return 0, 0, 0, 0
+            return empty_result
         
         # Reset no entries counter if we found entries
         feed.no_entries_count = 0
@@ -559,178 +727,166 @@ def process_feed(
             sorted_entries.append((entry, published_date or datetime.min))
         
         sorted_entries.sort(key=lambda x: x[1], reverse=True)
-        
+
         # Limit to max_articles
         sorted_entries = sorted_entries[:max_articles]
-        
+
         new_article_count = 0
         jina_enhanced_count = 0
         with_summary_count = 0
         with_value_count = 0
-        
+        upgraded_count = 0
+        min_full_chars = config.min_full_content_chars if config else 1000
+
         for entry, published_date in sorted_entries:
-            guid = entry.get('id', entry.get('link', ''))
-            if not guid:
-                continue
-            
-            # Get the article URL first to check for URL-based duplicates
-            article_url = entry.get('link', guid)
-            
-            # Check if article already exists by GUID or URL
-            existing_article = db_session.query(Article).filter(
-                (Article.guid == guid) | (Article.url == article_url)
-            ).first()
-            if existing_article:
-                continue
-            
-            # Extract content from feed entry
-            content = extract_content(entry)
-            
-            # Try to fetch content from Jina.ai in these cases:
-            # 1. No content was found in the feed
-            # 2. Content is too short (likely truncated)
-            # 3. Content appears to be just a summary or snippet
-            jina_enhanced = False
-            should_fetch_jina = (
-                not content or 
-                len(content) < 1000 or  # Content is suspiciously short
-                "[...]".lower() in content.lower() or  # Content contains ellipsis indicating truncation
-                "read more".lower() in content.lower() or  # Content has "read more" prompt
-                "continue reading".lower() in content.lower()  # Content has "continue reading" prompt
-            )
-            
-            # Check if this is an aggregator feed that needs to peer through to the origin article
-            if feed.peer_through and entry.get('description'):
-                origin_url = extract_origin_url(entry.get('description', ''))
-                if origin_url and origin_url != article_url:
-                    logger.info(f"Feed is marked for peer-through. Using origin URL: {origin_url} instead of {article_url}")
-                    article_url = origin_url
-            
-            if should_fetch_jina and article_url.startswith('http'):
-                logger.info(f"Content may be incomplete for {article_url}, attempting to fetch from Jina.ai")
-                jina_content = fetch_jina_content(article_url)
-                
-                if jina_content and (not content or len(jina_content) > len(content)):
-                    logger.info(f"Using Jina.ai content for {article_url} - {len(jina_content)} chars vs original {len(content)} chars")
-                    content = jina_content
-                    jina_enhanced = True
-                    jina_enhanced_count += 1
-            
-            clean_content = clean_html(content)
-            
-            # Create new article
-            new_article = Article(
-                feed_id=feed.id,  # Ensure feed_id is set correctly
-                title=entry.get('title', 'Untitled'),
-                url=entry.get('link', ''),
-                guid=guid,
-                description=entry.get('summary', ''),
-                content=clean_content,
-                author=entry.get('author', ''),
-                published_at=published_date,
-                fetched_at=datetime.utcnow(),
-                processed=False,  # Will be set to True if we analyze it now
-                word_count=len(clean_content.split()),
-                jina_enhanced=jina_enhanced  # Set flag if content was fetched from Jina.ai
-            )
-            
-            # Log article information
-            word_count = len(clean_content.split())
-            logger.info(f"New article: '{new_article.title[:50]}' ({word_count} words, {len(clean_content)} chars)")
-            if jina_enhanced:
-                logger.info(f"  - Content enhanced with Jina.ai")
-            if new_article.author:
-                logger.info(f"  - Author: {new_article.author}")
-            if published_date:
-                logger.info(f"  - Published: {published_date.strftime('%Y-%m-%d %H:%M')}")
-            
-            # Double-check that feed_id is set correctly
-            if not new_article.feed_id:
-                logger.warning(f"feed_id not set for article {new_article.title}. Setting manually.")
-                new_article.feed_id = feed.id
-            
-            # Analyze the article if requested and we have a configuration
-            if analyze_content and config and clean_content:
-                if progress_callback:
-                    progress_callback(f"Analyzing article: {new_article.title[:30]}")
-                
-                analysis_start_time = time.time()
-                
-                # Generate summary
-                if config.openrouter_api_key and config.openrouter_prompt:
-                    logger.info(f"Generating summary for article: {new_article.title[:50]}")
-                    summary_start_time = time.time()
-                    summary = generate_summary(
-                        clean_content,
-                        config.openrouter_api_key,
-                        config.openrouter_prompt,
-                        config.openrouter_model
+            # Savepoint per entry: a failure discards only this entry's work,
+            # not the articles accepted earlier in the same run.
+            savepoint = db_session.begin_nested()
+            try:
+                guid = entry.get('id', entry.get('link', ''))
+                if not guid:
+                    savepoint.rollback()
+                    continue
+
+                # Get the article URL first to check for URL-based duplicates
+                article_url = entry.get('link', guid)
+                source_url = article_url
+
+                # Check if this is an aggregator feed that needs to peer through to the origin article
+                if feed.peer_through and entry.get('description'):
+                    origin_url = extract_origin_url(entry.get('description', ''))
+                    if origin_url and origin_url != article_url:
+                        logger.info(f"Feed is marked for peer-through. Using origin URL: {origin_url} instead of {article_url}")
+                        source_url = origin_url
+
+                # Check if article already exists by GUID, URL, or the public
+                # original URL recorded on a previous (possibly aggregator) row.
+                existing_article = db_session.query(Article).filter(
+                    (Article.guid == guid) |
+                    (Article.url == article_url) |
+                    (
+                        (Article.source_public_url == source_url) &
+                        (Article.source_public_url.isnot(None))
                     )
-                    summary_duration = time.time() - summary_start_time
-                    if summary:
-                        new_article.summary = summary
+                ).first()
+
+                if existing_article:
+                    upgraded = _maybe_upgrade_article(
+                        existing_article,
+                        entry,
+                        source_url,
+                        feed,
+                        config,
+                        analyze_content,
+                        min_full_chars,
+                        progress_callback,
+                    )
+                    upgraded_count += upgraded
+                    # Only count a summary produced by the inline re-analysis of
+                    # an upgrade, not summaries that already existed.
+                    if upgraded and existing_article.summary:
                         with_summary_count += 1
-                        logger.info(f"Summary generated successfully in {summary_duration:.2f}s ({len(summary)} chars)")
-                    else:
-                        logger.warning(f"Failed to generate summary after {summary_duration:.2f}s")
-                
-                # Analyze value
-                if config.openrouter_api_key and config.value_prompt_enabled and config.value_prompt:
-                    logger.info(f"Analyzing value for article: {new_article.title[:50]}")
-                    value_start_time = time.time()
-                    quality_tier, quality_score, labels = analyze_value(
-                        clean_content,
-                        config.openrouter_api_key,
-                        config.value_prompt,
-                        config.openrouter_processing_model or config.openrouter_model
+                    savepoint.commit()
+                    continue
+
+                # Decide which copy to adopt and record why it was accepted
+                assessment = adopt_entry_content(
+                    entry,
+                    source_url=source_url,
+                    fetch_supplemental=fetch_jina_content,
+                    clean_fn=clean_html,
+                    threshold=min_full_chars,
+                )
+                clean_content = assessment.text
+                jina_enhanced = assessment.source == CONTENT_SOURCE_SUPPLEMENTAL
+                if jina_enhanced:
+                    jina_enhanced_count += 1
+
+                # Create new article
+                new_article = Article(
+                    feed_id=feed.id,  # Ensure feed_id is set correctly
+                    title=entry.get('title', 'Untitled'),
+                    url=entry.get('link', ''),
+                    guid=guid,
+                    description=entry.get('summary', ''),
+                    author=entry.get('author', ''),
+                    published_at=published_date,
+                    fetched_at=datetime.utcnow(),
+                    processed=False,  # Will be set to True if we analyze it now
+                )
+                apply_content_adoption(
+                    new_article,
+                    assessment,
+                    source_feed_id=feed.id,
+                    is_new=True,
+                )
+
+                # Log article information
+                word_count = len(clean_content.split())
+                logger.info(f"New article: '{new_article.title[:50]}' ({word_count} words, {len(clean_content)} chars, {assessment.status}, {assessment.acceptance})")
+                if jina_enhanced:
+                    logger.info(f"  - Content enhanced with Jina.ai")
+                if new_article.author:
+                    logger.info(f"  - Author: {new_article.author}")
+                if published_date:
+                    logger.info(f"  - Published: {published_date.strftime('%Y-%m-%d %H:%M')}")
+
+                # Double-check that feed_id is set correctly
+                if not new_article.feed_id:
+                    logger.warning(f"feed_id not set for article {new_article.title}. Setting manually.")
+                    new_article.feed_id = feed.id
+
+                # Analyze the article if requested and we have a configuration
+                if analyze_content and config and clean_content:
+                    summary_generated, value_analyzed = _analyze_article(
+                        new_article, clean_content, config, progress_callback
                     )
-                    value_duration = time.time() - value_start_time
-                    
-                    new_article.quality_tier = quality_tier
-                    new_article.quality_score = quality_score
-                    new_article.labels = labels
-                    
-                    if quality_tier:
+                    if summary_generated:
+                        with_summary_count += 1
+                    if value_analyzed:
                         with_value_count += 1
-                        logger.info(f"Value analysis completed in {value_duration:.2f}s: Tier {quality_tier}, Score {quality_score}, Labels: {labels}")
-                    else:
-                        logger.warning(f"Value analysis failed after {value_duration:.2f}s")
-                
-                # Mark as processed
-                new_article.processed = True
-                new_article.processed_at = datetime.utcnow()
-                
-                total_analysis_duration = time.time() - analysis_start_time
-                logger.info(f"Total analysis time for article '{new_article.title[:50]}': {total_analysis_duration:.2f}s")
-            
-            db_session.add(new_article)
-            new_article_count += 1
-        
+
+                db_session.add(new_article)
+                # Flush so duplicates within the same ingest run are visible
+                db_session.flush()
+                savepoint.commit()
+                new_article_count += 1
+            except Exception as e:
+                logger.error(f"Error processing entry in feed {feed.title}: {str(e)}")
+                savepoint.rollback()
+                continue
+
         # Update feed last updated timestamp if new articles were found
         if new_article_count > 0:
             feed.last_updated = datetime.utcnow()
-        
+
         # Reset error count if successful
         feed.error_count = 0
         feed.last_error = None
-        
+
         db_session.commit()
-        return new_article_count, jina_enhanced_count, with_summary_count, with_value_count
-    
+        return {
+            "new_articles": new_article_count,
+            "jina_enhanced": jina_enhanced_count,
+            "with_summary": with_summary_count,
+            "with_value_analysis": with_value_count,
+            "upgraded_articles": upgraded_count,
+        }
+
     except Exception as e:
         logger.error(f"Error processing feed {feed.title}: {str(e)}")
         # Update error information
         feed.error_count = getattr(feed, 'error_count', 0) + 1
         feed.last_error = str(e)
-        
+
         # Check if we should mark the feed as inactive due to too many errors
         if feed.error_count >= max_errors:
             logger.warning(f"Feed {feed.title} has had {feed.error_count} consecutive errors. Marking as muted.")
             feed.muted = True
             feed.muted_reason = f"Auto-muted after {feed.error_count} consecutive errors. Last error: {feed.last_error}"
-        
+
         db_session.commit()
-        return 0, 0, 0, 0
+        return empty_result
 
 
 def process_all_feeds(
@@ -762,19 +918,21 @@ def process_all_feeds(
     if not feeds:
         logger.warning("No active feeds found in database")
         return {
-            "feeds_processed": 0, 
-            "new_articles": 0, 
+            "feeds_processed": 0,
+            "new_articles": 0,
             "auto_muted": 0,
             "jina_enhanced": 0,
             "with_summary": 0,
-            "with_value_analysis": 0
+            "with_value_analysis": 0,
+            "upgraded_articles": 0
         }
-    
+
     total_new_articles = 0
     auto_muted_count = 0
     total_jina_enhanced = 0
     total_with_summary = 0
     total_with_value = 0
+    total_upgraded = 0
     # Create a beautiful Rich progress bar
     with Progress(
         SpinnerColumn(),
@@ -805,9 +963,9 @@ def process_all_feeds(
                 progress.update(main_task, description=f"[bold blue]{msg[:40]}")
             
             # Process the feed
-            new_articles, jina_enhanced, with_summary, with_value = process_feed(
+            feed_result = process_feed_result(
                 feed,
-                db_session, 
+                db_session,
                 lookback_days=lookback_days,
                 max_articles=max_articles_per_feed,
                 progress_callback=update_progress,
@@ -816,20 +974,26 @@ def process_all_feeds(
                 config=config,
                 analyze_content=analyze_content
             )
-            
+            new_articles = feed_result["new_articles"]
+            jina_enhanced = feed_result["jina_enhanced"]
+            with_summary = feed_result["with_summary"]
+            with_value = feed_result["with_value_analysis"]
+            upgraded = feed_result["upgraded_articles"]
+
             # Calculate processing time
             feed_duration = time.time() - feed_start_time
-            
+
             # Update stats field with colorful information
-            stats_text = f"[green]new:[/green] {new_articles} [yellow]jina:[/yellow] {jina_enhanced} [blue]summary:[/blue] {with_summary} [magenta]value:[/magenta] {with_value} [cyan]time:[/cyan] {feed_duration:.1f}s"
+            stats_text = f"[green]new:[/green] {new_articles} [yellow]jina:[/yellow] {jina_enhanced} [blue]summary:[/blue] {with_summary} [magenta]value:[/magenta] {with_value} [cyan]upgraded:[/cyan] {upgraded} [cyan]time:[/cyan] {feed_duration:.1f}s"
             progress.update(main_task, stats=stats_text)
-            
+
             # Advance the progress
             progress.update(main_task, advance=1)
         total_new_articles += new_articles
         total_jina_enhanced += jina_enhanced
         total_with_summary += with_summary
         total_with_value += with_value
+        total_upgraded += upgraded
         
         # Check if feed was auto-muted during processing
         if not was_muted_before and feed.muted:
@@ -845,5 +1009,6 @@ def process_all_feeds(
         "auto_muted": auto_muted_count,
         "jina_enhanced": total_jina_enhanced,
         "with_summary": total_with_summary,
-        "with_value_analysis": total_with_value
+        "with_value_analysis": total_with_value,
+        "upgraded_articles": total_upgraded
     }

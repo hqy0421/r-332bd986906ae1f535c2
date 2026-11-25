@@ -152,6 +152,11 @@ Content:
     def similarity_threshold(self) -> float:
         """Get similarity threshold for duplicate detection and story merging."""
         return self.get("feeds", "similarity_threshold", 0.65)
+
+    @property
+    def min_full_content_chars(self) -> int:
+        """Minimum cleaned character count for feed content to count as a full body."""
+        return self.get("feeds", "min_full_content_chars", 1000)
     
     @property
     def excerpt_length(self) -> int:
